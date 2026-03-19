@@ -1,0 +1,7 @@
+[Unit]
+Description=Context Engine compile trigger (curl POST /compile)
+After=context-engine.service
+
+[Service]
+Type=oneshot
+ExecStart=/home/chris/projects/context-engine/scripts/trigger_compile.sh

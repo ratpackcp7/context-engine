@@ -1,0 +1,19 @@
+[Unit]
+Description=Context Engine FastAPI service
+After=network-online.target tailscaled.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/chris/projects/context-engine
+EnvironmentFile=/home/chris/projects/context-engine/.env
+ExecStart=/home/chris/projects/context-engine/venv/bin/uvicorn src.main:app --host 127.0.0.1 --port 8410
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=false
+
+[Install]
+WantedBy=default.target
