@@ -1,0 +1,12 @@
+<!DOCTYPE html>
+<html>
+<head><meta charset="utf-8"><title>Context Engine Digest</title></head>
+<body>
+  <h1>Context Engine Daily Digest</h1>
+  <p><em>{{ generated_at }}</em></p>
+  {% if stale_count > 0 %}
+  <p><strong>⚠️ {{ stale_count }} stale item(s)</strong> need attention</p>
+  {% endif %}
+  <div>{{ summary_html }}</div>
+</body>
+</html>
