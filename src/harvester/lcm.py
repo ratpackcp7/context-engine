@@ -19,10 +19,7 @@ async def harvest_lcm(
     settings: Settings | None = None,
     client: httpx.AsyncClient | None = None,
 ) -> list[HarvestedItem]:
-    """Search LCM-Lite for sessions matching project_slug.
-
-    GET {lcm_url}/search?q={project_slug}&limit=10
-    """
+    """Search LCM-Lite for sessions matching project_slug."""
     settings = settings or Settings()
     if not settings.lcm_lite_url or not settings.lcm_lite_token:
         logger.warning("LCM-Lite URL or token not configured, skipping")
@@ -34,7 +31,11 @@ async def harvest_lcm(
 
     try:
         headers = {"Authorization": f"Bearer {settings.lcm_lite_token}"}
-        params = {"q": project_slug, "limit": 10}
+        # Replace hyphens with spaces — FTS5 treats hyphens as NOT operator
+        safe_query = project_slug.replace("-", " ")
+        params: dict = {"q": safe_query, "limit": 10}
+        if since:
+            params["after"] = since
 
         resp = await client.get(
             f"{settings.lcm_lite_url}/search",
@@ -44,43 +45,37 @@ async def harvest_lcm(
         resp.raise_for_status()
         data = resp.json()
 
-        # LCM-Lite returns a list of session objects (or results key)
         results = data if isinstance(data, list) else data.get("results", [])
 
         items: list[HarvestedItem] = []
         for entry in results:
-            # Extract timestamp — try common field names
             timestamp = (
-                entry.get("timestamp")
-                or entry.get("created_at")
-                or entry.get("date")
+                entry.get("created_at")
+                or entry.get("timestamp")
                 or datetime.now(timezone.utc).isoformat()
             )
 
-            # Filter by since if provided
-            if since:
-                try:
-                    entry_dt = datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
-                    since_dt = datetime.fromisoformat(since.replace("Z", "+00:00"))
-                    if entry_dt < since_dt:
-                        continue
-                except (ValueError, AttributeError):
-                    pass
+            # Extract content from LCM-Lite search result format
+            snippet = entry.get("snippet", "")
+            session_id = entry.get("session_id", "")
+            message_id = entry.get("message_id", "")
+            project = entry.get("project", "")
 
-            # Extract content
-            title = entry.get("title", entry.get("name", ""))
-            summary = entry.get("summary", entry.get("content", entry.get("text", "")))
-            content = f"{title}: {summary}" if title and summary else title or summary
-
-            if not content:
+            # Only include results that match our project
+            slug_words = set(project_slug.lower().replace("-", " ").split())
+            result_project = project.lower().replace("-", " ")
+            snippet_lower = snippet.lower()
+            if not any(w in result_project or w in snippet_lower for w in slug_words):
                 continue
 
-            source_id = str(entry.get("id", entry.get("session_id", ""))) or None
+            content = snippet[:500] if snippet else f"Session {session_id}"
+            if not content.strip():
+                continue
 
             items.append(
                 HarvestedItem(
                     source="lcm",
-                    source_id=source_id,
+                    source_id=message_id or None,
                     project_slug=project_slug,
                     category="note",
                     content=content,
@@ -88,10 +83,11 @@ async def harvest_lcm(
                 )
             )
 
+        logger.info("LCM-Lite: %d results for '%s'", len(items), safe_query)
         return items
 
-    except httpx.HTTPError as exc:
-        logger.error("LCM-Lite harvest failed: %s", exc)
+    except Exception as exc:
+        logger.warning("LCM-Lite harvest failed for %s: %s", project_slug, exc)
         return []
 
     finally:
