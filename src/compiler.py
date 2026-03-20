@@ -249,6 +249,9 @@ async def _run_compile_inner(
                 local_harvested = _sessions_to_harvested_json(local_sessions)
                 current_bullets = await _get_active_bullets(db, proj_id)
                 harvested_dicts = [item.model_dump() for item in harvested] + local_harvested
+                # Cap data sent to LLM to prevent token overflow
+                harvested_dicts.sort(key=lambda x: x.get("timestamp", ""), reverse=True)
+                harvested_dicts = harvested_dicts[:30]
 
                 logger.info(
                     "%s: %d harvested, %d local sessions, %d current bullets",

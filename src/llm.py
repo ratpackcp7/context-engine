@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import re
 
@@ -13,26 +14,44 @@ from src.models import CompileDelta
 
 logger = logging.getLogger(__name__)
 
-_FENCE_RE = re.compile(r"^```(?:json)?\s*\n?(.*?)\n?```\s*$", re.DOTALL)
-
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 PRIMARY_MODEL = "deepseek/deepseek-chat"  # DeepSeek V3 — fast, ~$0.0001/call
 
+# Patterns to strip from LLM output before JSON parsing
+_THINK_RE = re.compile(r"<think>.*?</think>", re.DOTALL)
+_FENCE_RE = re.compile(r"```(?:json)?\s*\n?(.*?)\n?```", re.DOTALL)
 
-def strip_fences(text: str) -> str:
-    text = text.strip()
-    m = _FENCE_RE.match(text)
+
+def extract_json(text: str) -> str:
+    """Extract JSON from LLM output, stripping thinking tags, fences, and preamble."""
+    # Strip <think>...</think> blocks (DeepSeek V3)
+    text = _THINK_RE.sub("", text).strip()
+
+    # Strip markdown code fences
+    m = _FENCE_RE.search(text)
     if m:
-        return m.group(1).strip()
-    return text
+        text = m.group(1).strip()
+
+    # Find the first { and last } — extract the JSON object
+    start = text.find("{")
+    end = text.rfind("}")
+    if start != -1 and end != -1 and end > start:
+        text = text[start : end + 1]
+
+    return text.strip()
 
 
 def parse_compile_delta(raw: str) -> CompileDelta | None:
-    cleaned = strip_fences(raw)
+    """Parse raw LLM text into a CompileDelta, returning None on failure."""
+    cleaned = extract_json(raw)
+    if not cleaned:
+        logger.warning("No JSON found in LLM output (length=%d)", len(raw))
+        return None
     try:
         return CompileDelta.model_validate_json(cleaned)
     except Exception as exc:
-        logger.warning("Failed to parse CompileDelta: %s", exc)
+        # Log a snippet of what we tried to parse
+        logger.warning("Failed to parse CompileDelta: %s — raw snippet: %s", exc, cleaned[:200])
         return None
 
 
@@ -58,7 +77,8 @@ class LLMClient:
         if delta is None:
             logger.info("Parse failed, retrying with stricter prompt")
             strict = (
-                "IMPORTANT: Respond with ONLY valid JSON, no markdown fences, no explanation.\n\n"
+                "IMPORTANT: Respond with ONLY valid JSON. No <think> tags, no markdown fences, "
+                "no explanation. Just the raw JSON object starting with { and ending with }.\n\n"
                 + prompt
             )
             text = await self._call(strict)
@@ -92,7 +112,7 @@ class LLMClient:
                         "model": PRIMARY_MODEL,
                         "messages": [{"role": "user", "content": prompt}],
                         "temperature": 0.2,
-                        "max_tokens": 4096,
+                        "max_tokens": 16384,
                     },
                 )
                 resp.raise_for_status()
