@@ -20,11 +20,29 @@ async def harvest_all(
 ) -> list[HarvestedItem]:
     """Run all harvesters and deduplicate by source_id.
 
+    Each harvester is wrapped in try/except so a failure in one source
+    (e.g. Notion 404) doesn't block the others.
+
     Returns combined list[HarvestedItem] with duplicates removed.
     """
-    todos = await harvest_todos(project_slug, since)
-    sessions = await harvest_sessions(project_slug, since)
-    lcm = await harvest_lcm(project_slug, since)
+    todos: list[HarvestedItem] = []
+    sessions: list[HarvestedItem] = []
+    lcm: list[HarvestedItem] = []
+
+    try:
+        todos = await harvest_todos(project_slug, since)
+    except Exception as e:
+        logger.warning("Notion todo harvest failed for %s: %s", project_slug, e)
+
+    try:
+        sessions = await harvest_sessions(project_slug, since)
+    except Exception as e:
+        logger.warning("Notion session harvest failed for %s: %s", project_slug, e)
+
+    try:
+        lcm = await harvest_lcm(project_slug, since)
+    except Exception as e:
+        logger.warning("LCM-Lite harvest failed for %s: %s", project_slug, e)
 
     all_items = todos + sessions + lcm
 

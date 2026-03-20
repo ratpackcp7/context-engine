@@ -48,10 +48,14 @@ def _staleness_threshold(category: str, settings: Settings) -> int:
 
 
 async def _get_last_compile_time(db: aiosqlite.Connection, project_slug: str) -> str | None:
-    """Get the completed_at of the most recent successful compile for a project."""
+    """Get the completed_at of the most recent SUCCESSFUL compile for a project.
+    
+    Only considers compiles where error IS NULL — failed compiles must not
+    advance the 'since' window or unprocessed sessions get permanently skipped.
+    """
     cursor = await db.execute(
         """SELECT completed_at FROM compile_runs
-           WHERE project_slugs LIKE ? AND completed_at IS NOT NULL
+           WHERE project_slugs LIKE ? AND completed_at IS NOT NULL AND error IS NULL
            ORDER BY completed_at DESC LIMIT 1""",
         (f'%"{project_slug}"%',),
     )
@@ -117,7 +121,6 @@ async def _apply_deltas(
     updated = 0
     archived = 0
 
-    # ADD new bullets
     for bullet in delta.add:
         bullet_id = str(uuid.uuid4())
         await db.execute(
@@ -130,9 +133,7 @@ async def _apply_deltas(
         )
         added += 1
 
-    # UPDATE existing bullets
     for upd in delta.update:
-        # Validate bullet_id exists
         cursor = await db.execute(
             "SELECT id FROM bullets WHERE id = ? AND project_id = ?",
             (upd.bullet_id, project_id),
@@ -147,7 +148,6 @@ async def _apply_deltas(
         )
         updated += 1
 
-    # ARCHIVE bullets
     for arch in delta.archive:
         cursor = await db.execute(
             "SELECT id FROM bullets WHERE id = ? AND project_id = ?",
@@ -166,10 +166,7 @@ async def _apply_deltas(
 
 
 async def _staleness_scan(db: aiosqlite.Connection, project_id: str, settings: Settings) -> None:
-    """Check active bullets against per-category staleness thresholds.
-
-    Marks bullets as 'stale' if last_verified_at exceeds the threshold.
-    """
+    """Check active bullets against per-category staleness thresholds."""
     now = datetime.now(timezone.utc)
     cursor = await db.execute(
         "SELECT id, category, last_verified_at FROM bullets WHERE project_id = ? AND status = 'active'",
@@ -181,7 +178,6 @@ async def _staleness_scan(db: aiosqlite.Connection, project_id: str, settings: S
         category = row[1]
         last_verified = row[2]
         threshold_hours = _staleness_threshold(category, settings)
-        # threshold of 0 means always flagged (blockers)
         try:
             verified_dt = datetime.fromisoformat(last_verified)
             if verified_dt.tzinfo is None:
@@ -202,16 +198,7 @@ async def run_compile(
     settings: Settings | None = None,
     llm_client: LLMClient | None = None,
 ) -> dict:
-    """Main compile entry point. Runs as BackgroundTask inside FastAPI.
-
-    Args:
-        project_slug: Compile a single project, or all active projects if None.
-        settings: Settings instance (uses default if None).
-        llm_client: LLM client instance (creates default if None).
-
-    Returns:
-        Compile run record as dict.
-    """
+    """Main compile entry point. Runs as BackgroundTask inside FastAPI."""
     async with _compile_lock:
         return await _run_compile_inner(project_slug, settings, llm_client)
 
@@ -230,13 +217,10 @@ async def _run_compile_inner(
     total_updated = 0
     total_archived = 0
     compiled_slugs: list[str] = []
-    llm_provider: str | None = None
-    llm_model: str | None = None
     error: str | None = None
 
     db = await get_db(settings.context_engine_db)
     try:
-        # Get projects to compile
         if project_slug:
             cursor = await db.execute(
                 "SELECT id, slug, name FROM projects WHERE slug = ? AND status = 'active'",
@@ -257,38 +241,32 @@ async def _run_compile_inner(
             proj_name = project[2]
 
             try:
-                # Step 1: Get last compile time
                 last_compile = await _get_last_compile_time(db, proj_slug)
+                logger.info("Compiling %s (since=%s)", proj_slug, last_compile)
 
-                # Step 2: Harvest from external sources
                 harvested = await harvest_all(proj_slug, since=last_compile)
-
-                # Also harvest local sessions
                 local_sessions = await _get_local_sessions(db, proj_id, last_compile)
                 local_harvested = _sessions_to_harvested_json(local_sessions)
-
-                # Step 3: Load current bullets
                 current_bullets = await _get_active_bullets(db, proj_id)
-
-                # Combine harvested items
                 harvested_dicts = [item.model_dump() for item in harvested] + local_harvested
 
-                # Step 4: If no new data and no active bullets to check staleness on, skip LLM
+                logger.info(
+                    "%s: %d harvested, %d local sessions, %d current bullets",
+                    proj_slug, len(harvested), len(local_sessions), len(current_bullets),
+                )
+
                 if not harvested_dicts and not current_bullets:
-                    logger.info("No data for %s, skipping compile", proj_slug)
+                    logger.info("No data for %s, skipping", proj_slug)
                     compiled_slugs.append(proj_slug)
-                    # Still run staleness scan
                     await _staleness_scan(db, proj_id, settings)
                     continue
 
-                # If no new harvested data, skip LLM call but still run staleness
                 if not harvested_dicts:
-                    logger.info("No new data for %s, skipping LLM call", proj_slug)
+                    logger.info("No new data for %s, skipping LLM", proj_slug)
                     compiled_slugs.append(proj_slug)
                     await _staleness_scan(db, proj_id, settings)
                     continue
 
-                # Step 5: Render prompt
                 template = _jinja_env.get_template("compile_prompt.md")
                 prompt = template.render(
                     project_name=proj_name,
@@ -296,28 +274,21 @@ async def _run_compile_inner(
                     harvested_data_json=json.dumps(harvested_dicts, indent=2),
                 )
 
-                # Step 6: Call LLM
                 delta = await llm.compile(prompt)
                 if delta is None:
                     logger.warning("LLM failed for %s, skipping", proj_slug)
+                    error = f"{proj_slug}: LLM returned None"
                     compiled_slugs.append(proj_slug)
                     await _staleness_scan(db, proj_id, settings)
                     continue
 
-                # Step 7: Apply deltas
                 added, updated, archived = await _apply_deltas(db, proj_id, delta)
                 total_added += added
                 total_updated += updated
                 total_archived += archived
-
-                # Step 8: Staleness scan
                 await _staleness_scan(db, proj_id, settings)
-
                 compiled_slugs.append(proj_slug)
-                logger.info(
-                    "Compiled %s: +%d ~%d -%d",
-                    proj_slug, added, updated, archived,
-                )
+                logger.info("Compiled %s: +%d ~%d -%d", proj_slug, added, updated, archived)
 
             except Exception as exc:
                 logger.error("Compile failed for %s: %s", proj_slug, exc)
@@ -325,7 +296,6 @@ async def _run_compile_inner(
 
         await db.commit()
 
-        # Record compile run
         completed_at = _now()
         await db.execute(
             """INSERT INTO compile_runs
@@ -337,7 +307,7 @@ async def _run_compile_inner(
                 run_id, started_at, completed_at,
                 json.dumps(compiled_slugs),
                 total_added, total_updated, total_archived,
-                llm_provider, llm_model, error,
+                "openrouter", "deepseek/deepseek-chat", error,
             ),
         )
         await db.commit()
@@ -350,14 +320,13 @@ async def _run_compile_inner(
             "bullets_added": total_added,
             "bullets_updated": total_updated,
             "bullets_archived": total_archived,
-            "llm_provider": llm_provider,
-            "llm_model": llm_model,
+            "llm_provider": "openrouter",
+            "llm_model": "deepseek/deepseek-chat",
             "error": error,
         }
 
     except Exception as exc:
         logger.error("Compile run failed: %s", exc)
-        # Record failed run
         try:
             await db.execute(
                 """INSERT INTO compile_runs
@@ -371,16 +340,10 @@ async def _run_compile_inner(
         except Exception:
             pass
         return {
-            "id": run_id,
-            "started_at": started_at,
-            "completed_at": None,
-            "project_slugs": compiled_slugs,
-            "bullets_added": 0,
-            "bullets_updated": 0,
-            "bullets_archived": 0,
-            "llm_provider": None,
-            "llm_model": None,
-            "error": str(exc),
+            "id": run_id, "started_at": started_at, "completed_at": None,
+            "project_slugs": compiled_slugs, "bullets_added": 0,
+            "bullets_updated": 0, "bullets_archived": 0,
+            "llm_provider": None, "llm_model": None, "error": str(exc),
         }
     finally:
         await db.close()

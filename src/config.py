@@ -9,10 +9,13 @@ class Settings(BaseSettings):
     context_engine_token: str = ""
     context_engine_db: str = "./data/context.db"
 
-    # Gemini
+    # OpenRouter (primary LLM)
+    openrouter_api_key: str = ""
+
+    # Gemini (legacy, unused if OpenRouter configured)
     gemini_api_key: str = ""
 
-    # Ollama
+    # Ollama (fallback)
     ollama_url: str = "http://localhost:11434"
     ollama_model: str = "qwen3:1.7b"
 
